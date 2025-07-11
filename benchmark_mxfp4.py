@@ -3,10 +3,12 @@ import sys
 import os
 import torch
 import triton
+import aiter
 from aiter.ops.triton.gemm_afp4wfp4 import (
     gemm_afp4wfp4,
     gemm_afp4wfp4_preshuffled_scales,
 )
+from aiter.ops.shuffle import shuffle_weight
 from op_tests.triton_tests.test_gemm_afp4wfp4 import generate_gemm_afp4wfp4_inputs
 
 TRITON_HIP_PRESHUFFLE_SCALES = (
@@ -23,6 +25,7 @@ from iree.turbine.kernel.wave.utils.run_utils import (
 from iree.turbine.kernel.lang.global_symbols import *
 from iree.turbine.kernel.wave.utils.general_utils import (
     get_default_scheduling_params,
+    torch_dtype_to_wave,
 )
 from iree.turbine.kernel.wave.constraints import (
     ScaledMMAType,
@@ -31,8 +34,9 @@ from iree.turbine.kernel.wave.constraints import (
 # Note this is specified by the HW and cannot be changed.
 SCALE_GROUP_SIZE = 32
 
-def get_mxfp4_gemm(shape):
+def get_mxfp4_gemm(shape, c_dtype):
     mfma_variant = ScaledMMAType.F32_16x16x128_F8F6F4
+    c_wave_dtype = torch_dtype_to_wave(c_dtype)
     # Input sizes
     M = tkl.sym.M
     N = tkl.sym.N
@@ -58,22 +62,13 @@ def get_mxfp4_gemm(shape):
         )
     ]
 
-    i = tkw.IndexMapping.iterator(0)
-    j = tkw.IndexMapping.iterator(1)
-    b_mapping = tkw.IndexMapping(
-        num_iterators=2, inputs={N: i, K: j}, outputs={N: i, K: j}
-    )
-    # b: tkl.Memory[K/2, N, ADDRESS_SPACE, tkl.i8],
-    # b: tkl.Memory[N, K/2, ADDRESS_SPACE, tkl.i8],
-
     @tkw.wave(constraints)
     def gemm_afp4_wfp4_wave(
         a: tkl.Memory[M, K / 2, ADDRESS_SPACE, tkl.i8],
         a_scale: tkl.Memory[M, K / 32, ADDRESS_SPACE, tkl.i8],
         b: tkl.Memory[N, K / 2, ADDRESS_SPACE, tkl.i8],
-        # b: tkl.Memory[K / 2, N, ADDRESS_SPACE, tkl.i8],
         b_scale: tkl.Memory[N, K / 32, ADDRESS_SPACE, tkl.i8],
-        c: tkl.Memory[M, N, GLOBAL_ADDRESS_SPACE, tkl.f32],
+        c: tkl.Memory[M, N, GLOBAL_ADDRESS_SPACE, tkl.bf16],
     ):
         c_reg = tkl.Register[M, N, tkl.f32](0.0)
 
@@ -83,15 +78,15 @@ def get_mxfp4_gemm(shape):
             a_reg = tkw.bitcast(a_reg, tkl.f4e2m1fn)
             a_scale_reg = tkw.read(a_scale)
             a_scale_reg = tkw.bitcast(a_scale_reg, tkl.f8e8m0fnu)
-            b_reg = tkw.read(b, mapping=b_mapping)
-            # b_reg = tkw.read(b)
+            b_reg = tkw.read(b)
             b_reg = tkw.bitcast(b_reg, tkl.f4e2m1fn)
             b_scale_reg = tkw.read(b_scale)
             b_scale_reg = tkw.bitcast(b_scale_reg, tkl.f8e8m0fnu)
             acc = tkw.scaled_mma(a_reg, a_scale_reg, b_reg, b_scale_reg, acc)
             return acc
 
-        tkw.write(repeat, c)
+        casted = tkw.cast(repeat, c_wave_dtype)
+        tkw.write(casted, c)
 
     hyperparams = {
         ADDRESS_SPACE: SHARED_ADDRESS_SPACE,
@@ -109,8 +104,12 @@ def get_mxfp4_gemm(shape):
         subs=hyperparams,
         canonicalize=True,
         schedule=SchedulingType.PREFETCH,
-        wave_runtime=True,
+        wave_runtime=False,
         dump_intermediates="./inter",
+        use_buffer_load_ops=True,
+        use_buffer_store_ops=True,
+        use_stride_cache_swizzle=True,
+        waves_per_eu=1,
     )
     options = set_default_run_config(options)
     gemm = wave_compile(options, gemm_afp4_wfp4_wave)
@@ -170,9 +169,17 @@ def run_benchmark(args):
     @triton.testing.perf_report([benchmark])
     def bench_gemm_afp4wfp4_blockscale(M, N, K, metric, provider):
         c_dtype = torch.bfloat16
-        x, w, _, _, x_scale, w_scale, _, _ = generate_gemm_afp4wfp4_inputs(
-            M, N, K, c_dtype
-        )
+        # x, w, _, _, x_scale, w_scale, _, _ = generate_gemm_afp4wfp4_inputs(
+        #     M, N, K, c_dtype
+        # )
+        x = torch.randn((M, K), device="cuda", dtype=c_dtype)
+        w = torch.randn((N, K), device="cuda", dtype=c_dtype)
+        quant_func = aiter.get_triton_quant(aiter.QuantType.per_1x32)
+        _, x_scale = quant_func(x, shuffle=False)
+        _, w_scale = quant_func(w, shuffle=False)
+        x, x_scales_shuffle = quant_func(x, shuffle=True)
+        w, w_scales_shuffle = quant_func(w, shuffle=True)
+        wshuffle = shuffle_weight(w, layout=(16, 16))
         # flops
         flops = 2.0 * M * N * K
         # memory transfer
@@ -196,19 +203,36 @@ def run_benchmark(args):
         else:
             if args.backend == "wave":
                 wave_shape = (M, N, K)
-                gemm = get_mxfp4_gemm(wave_shape)
-                w_t = w.T.contiguous()
-                wave_out = torch.empty(
-                    x.shape[0], w.shape[1], device=x.device, dtype=torch.float32
-                )
+                gemm = get_mxfp4_gemm(wave_shape, c_dtype)
+                wave_out = torch.empty(M, N, device=x.device, dtype=c_dtype)
+                # gemm(x, x_scale, w_t, w_scale, wave_out)
+                # triton_out = torch.empty(M, N, device="cuda", dtype=c_dtype)
+                # gemm_afp4wfp4(x, w.T, x_scale, w_scale, c_dtype, triton_out)
+                # torch.testing.assert_close(triton_out, wave_out)
                 ms = triton.testing.do_bench(
-                    lambda: gemm(x, x_scale, w_t, w_scale, wave_out),
+                    lambda: gemm(x, x_scale, w, w_scale, wave_out),
                     warmup=25,
                     rep=100,
                 )
-            else:
+            elif args.backend == "triton":
+                triton_out = torch.empty(M, N, device="cuda", dtype=c_dtype)
                 ms = triton.testing.do_bench(
-                    lambda: gemm_afp4wfp4(x, w, x_scale, w_scale, c_dtype, out),
+                    lambda: gemm_afp4wfp4(x, w.T, x_scale, w_scale, c_dtype, triton_out),
+                    warmup=25,
+                    rep=100,
+                )
+            elif args.backend == "ck":
+                ck_out = torch.empty((M + 255) // 256 * 256, N, device="cuda", dtype=c_dtype)
+                ms = triton.testing.do_bench(
+                    lambda: aiter.gemm_a4w4_blockscale(x, w, x_scales_shuffle, w_scales_shuffle, ck_out),
+                    warmup=25,
+                    rep=100,
+                )
+            elif args.backend == "asm":
+                asm_out = torch.empty((M + 255) // 256 * 256, N, device="cuda", dtype=c_dtype)
+                bias = torch.zeros(M, N, dtype=c_dtype)
+                ms = triton.testing.do_bench(
+                    lambda: aiter.gemm_a4w4_asm(x, w, x_scales_shuffle, w_scales_shuffle, asm_out, bias, bpreshuffle=False),
                     warmup=25,
                     rep=100,
                 )
@@ -263,7 +287,7 @@ def parse_args():
     parser.add_argument(
         "--backend",
         type=str,
-        choices=["triton", "wave"],
+        choices=["triton", "wave", "ck", "asm"],
         default="triton",
         help="backend to run gemm",
     )

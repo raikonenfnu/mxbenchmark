@@ -152,7 +152,7 @@ def run_benchmark(args):
     else:
         raise NotImplementedError(f"{args.metric} is not supported")
 
-    line_names = ["Triton"]
+    line_names = ["TFlops"]
     line_vals = ["triton"]
     benchmark = triton.testing.Benchmark(
         x_names=x_names,
@@ -210,14 +210,14 @@ def run_benchmark(args):
                 # gemm_afp4wfp4(x, w.T, x_scale, w_scale, c_dtype, triton_out)
                 # torch.testing.assert_close(triton_out, wave_out)
                 ms = triton.testing.do_bench(
-                    lambda: gemm(x, x_scale, w, w_scale, wave_out),
+                    lambda: gemm(x, x_scale.view(torch.uint8), w, w_scale.view(torch.uint8), wave_out),
                     warmup=25,
                     rep=100,
                 )
             elif args.backend == "triton":
                 triton_out = torch.empty(M, N, device="cuda", dtype=c_dtype)
                 ms = triton.testing.do_bench(
-                    lambda: gemm_afp4wfp4(x, w.T, x_scale, w_scale, c_dtype, triton_out),
+                    lambda: gemm_afp4wfp4(x, w.T, x_scale.view(torch.uint8), w_scale.view(torch.uint8), c_dtype, triton_out),
                     warmup=25,
                     rep=100,
                 )

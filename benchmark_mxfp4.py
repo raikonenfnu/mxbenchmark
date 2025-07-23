@@ -34,7 +34,7 @@ from wave_lang.kernel.wave.constraints import (
 # Note this is specified by the HW and cannot be changed.
 SCALE_GROUP_SIZE = 32
 
-def get_mxfp4_gemm(shape, c_dtype):
+def get_mxfp4_gemm(shape, c_dtype, use_async=False):
     mfma_variant = ScaledMMAType.F32_16x16x128_F8F6F4
     c_wave_dtype = torch_dtype_to_wave(c_dtype)
     # Input sizes
@@ -99,17 +99,21 @@ def get_mxfp4_gemm(shape, c_dtype):
         K_SCALE: shape[2] // 32,
     }
     hyperparams.update(get_default_scheduling_params())
-
+    schedule = SchedulingType.PREFETCH
+    if use_async:
+        # TODO: Add scheduling async support
+        schedule = SchedulingType.NONE
     options = WaveCompileOptions(
         subs=hyperparams,
         canonicalize=True,
-        schedule=SchedulingType.PREFETCH,
+        schedule=schedule,
         wave_runtime=False,
         dump_intermediates="./inter",
         use_buffer_load_ops=True,
         use_buffer_store_ops=True,
         use_stride_cache_swizzle=True,
         waves_per_eu=1,
+        use_global_to_shared=use_async,
     )
     options = set_default_run_config(options)
     gemm = wave_compile(options, gemm_afp4_wfp4_wave)
@@ -214,6 +218,15 @@ def run_benchmark(args):
                     warmup=25,
                     rep=100,
                 )
+            elif args.backend == "wave_async":
+                wave_shape = (M, N, K)
+                gemm = get_mxfp4_gemm(wave_shape, c_dtype, use_async=True)
+                wave_out = torch.empty(M, N, device=x.device, dtype=c_dtype)
+                ms = triton.testing.do_bench(
+                    lambda: gemm(x, x_scale.view(torch.uint8), w, w_scale.view(torch.uint8), wave_out),
+                    warmup=25,
+                    rep=100,
+                )
             elif args.backend == "triton":
                 triton_out = torch.empty(M, N, device="cuda", dtype=c_dtype)
                 ms = triton.testing.do_bench(
@@ -287,7 +300,7 @@ def parse_args():
     parser.add_argument(
         "--backend",
         type=str,
-        choices=["triton", "wave", "ck", "asm"],
+        choices=["triton", "wave", "ck", "asm", "wave_async"],
         default="triton",
         help="backend to run gemm",
     )

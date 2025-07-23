@@ -15,19 +15,19 @@ TRITON_HIP_PRESHUFFLE_SCALES = (
     os.environ.get("TRITON_HIP_PRESHUFFLE_SCALES", "0") == "1"
 )
 
-import iree.turbine.kernel.lang as tkl
-import iree.turbine.kernel.wave as tkw
-from iree.turbine.kernel.wave.compile import WaveCompileOptions, wave_compile
-from iree.turbine.kernel.wave.scheduling.schedule import SchedulingType
-from iree.turbine.kernel.wave.utils.run_utils import (
+import wave_lang.kernel.lang as tkl
+import wave_lang.kernel.wave as tkw
+from wave_lang.kernel.wave.compile import WaveCompileOptions, wave_compile
+from wave_lang.kernel.wave.scheduling.schedule import SchedulingType
+from wave_lang.kernel.wave.utils.run_utils import (
     set_default_run_config,
 )
-from iree.turbine.kernel.lang.global_symbols import *
-from iree.turbine.kernel.wave.utils.general_utils import (
+from wave_lang.kernel.lang.global_symbols import *
+from wave_lang.kernel.wave.utils.general_utils import (
     get_default_scheduling_params,
     torch_dtype_to_wave,
 )
-from iree.turbine.kernel.wave.constraints import (
+from wave_lang.kernel.wave.constraints import (
     ScaledMMAType,
 )
 
@@ -217,7 +217,7 @@ def run_benchmark(args):
             elif args.backend == "triton":
                 triton_out = torch.empty(M, N, device="cuda", dtype=c_dtype)
                 ms = triton.testing.do_bench(
-                    lambda: gemm_afp4wfp4(x, w.T, x_scale.view(torch.uint8), w_scale.view(torch.uint8), c_dtype, triton_out),
+                    lambda: gemm_afp4wfp4(x, w, x_scale.view(torch.uint8), w_scale.view(torch.uint8), c_dtype, triton_out),
                     warmup=25,
                     rep=100,
                 )

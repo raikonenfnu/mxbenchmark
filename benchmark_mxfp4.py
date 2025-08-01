@@ -10,11 +10,13 @@ from aiter.ops.triton.gemm_afp4wfp4 import (
 )
 from aiter.ops.shuffle import shuffle_weight
 from op_tests.triton_tests.test_gemm_afp4wfp4 import generate_gemm_afp4wfp4_inputs
+from aiter.utility.fp4_utils import scale_shuffle
 
 TRITON_HIP_PRESHUFFLE_SCALES = (
     os.environ.get("TRITON_HIP_PRESHUFFLE_SCALES", "0") == "1"
 )
 
+import numpy as np
 import wave_lang.kernel.lang as tkl
 import wave_lang.kernel.wave as tkw
 from wave_lang.kernel.wave.compile import WaveCompileOptions, wave_compile
@@ -214,7 +216,7 @@ def run_benchmark(args):
                 # gemm_afp4wfp4(x, w.T, x_scale, w_scale, c_dtype, triton_out)
                 # torch.testing.assert_close(triton_out, wave_out)
                 ms = triton.testing.do_bench(
-                    lambda: gemm(x, x_scale.view(torch.uint8), w, w_scale.view(torch.uint8), wave_out),
+                    lambda: gemm(x, x_scale[:M,:].view(torch.uint8), w, w_scale.view(torch.uint8), wave_out),
                     warmup=25,
                     rep=100,
                 )
@@ -249,6 +251,23 @@ def run_benchmark(args):
                     warmup=25,
                     rep=100,
                 )
+                x_scale_asm = scale_shuffle(x_scale.view(torch.uint8), shuffle=True)
+                w_scale_asm = scale_shuffle(w_scale.view(torch.uint8), shuffle=True)
+
+                aiter.gemm_a4w4_asm(x, w, x_scale_asm, w_scale_asm, asm_out, bias, bpreshuffle=False)
+
+                triton_out = torch.empty(M, N, device="cuda", dtype=c_dtype)
+                gemm_afp4wfp4(x, w, x_scale.view(torch.uint8), w_scale.view(torch.uint8), c_dtype, triton_out),
+                torch.testing.assert_close(triton_out, asm_out[:M,:])
+                np.save("x_vanilla.npy", x_scale.view(torch.int8).detach().cpu().numpy())
+                np.save("w_vanilla.npy", w_scale.view(torch.int8).detach().cpu().numpy())
+                np.save("x_shuffle_ref.npy", x_scales_shuffle.view(torch.int8).detach().cpu().numpy())
+                np.save("w_shuffle_ref.npy", w_scales_shuffle.view(torch.int8).detach().cpu().numpy())
+                torch.testing.assert_close(x_scale_asm.view(torch.int8), x_scales_shuffle.view(torch.int8))
+                torch.testing.assert_close(w_scale_asm.view(torch.int8), w_scales_shuffle.view(torch.int8))
+                # cool = torch.arange(128 * 256).reshape(128,256).to("cuda")
+                # cooler = scale_shuffle(cool, shuffle=True)
+                # breakpoint()
 
         # Return exactly one scalar depending on which metric is active
         if metric == "time":

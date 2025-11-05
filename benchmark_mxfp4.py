@@ -102,18 +102,17 @@ def get_mxfp4_gemm(shape, c_dtype, use_async=False):
     schedule = SchedulingType.PREFETCH
     if use_async:
         # TODO: Add scheduling async support
-        schedule = SchedulingType.NONE
+        schedule = SchedulingType.PREFETCH
     options = WaveCompileOptions(
         subs=hyperparams,
         canonicalize=True,
         schedule=schedule,
-        wave_runtime=False,
+        wave_runtime=True,
         dump_intermediates="./inter",
-        use_buffer_load_ops=True,
-        use_buffer_store_ops=True,
-        use_stride_cache_swizzle=True,
+        use_buffer_ops=True,
         waves_per_eu=1,
         use_global_to_shared=use_async,
+        minimize_shared_allocs=False,
     )
     options = set_default_run_config(options)
     gemm = wave_compile(options, gemm_afp4_wfp4_wave)
@@ -218,6 +217,10 @@ def run_benchmark(args):
                     warmup=25,
                     rep=100,
                 )
+                asm_out = torch.empty((M + 255) // 256 * 256, N, device="cuda", dtype=c_dtype)
+                bias = torch.zeros(M, N, dtype=c_dtype)
+                aiter.gemm_a4w4_asm(x, w, x_scales_shuffle, w_scales_shuffle, asm_out, bias, bpreshuffle=False)
+                torch.testing.assert_close(asm_out, wave_out)
             elif args.backend == "wave_async":
                 wave_shape = (M, N, K)
                 gemm = get_mxfp4_gemm(wave_shape, c_dtype, use_async=True)
@@ -227,10 +230,14 @@ def run_benchmark(args):
                     warmup=25,
                     rep=100,
                 )
+                asm_out = torch.empty((M + 255) // 256 * 256, N, device="cuda", dtype=c_dtype)
+                bias = torch.zeros(M, N, dtype=c_dtype)
+                aiter.gemm_a4w4_asm(x, w, x_scales_shuffle, w_scales_shuffle, asm_out, bias, bpreshuffle=False)
+                torch.testing.assert_close(asm_out, wave_out)
             elif args.backend == "triton":
                 triton_out = torch.empty(M, N, device="cuda", dtype=c_dtype)
                 ms = triton.testing.do_bench(
-                    lambda: gemm_afp4wfp4(x, w, x_scale.view(torch.uint8), w_scale.view(torch.uint8), c_dtype, triton_out),
+                    lambda: gemm_afp4wfp4(x.view(torch.uint8), w.view(torch.uint8), x_scale.view(torch.uint8), w_scale.view(torch.uint8), c_dtype, triton_out),
                     warmup=25,
                     rep=100,
                 )

@@ -46,55 +46,41 @@ def get_mxfp4_gemm(shape, c_dtype, use_async=False):
     M = tkl.sym.M
     N = tkl.sym.N
     K = tkl.sym.K
-    K_SCALE = tkl.sym.K_SCALE
     # Workgroup tile sizes
     BLOCK_M = tkl.sym.BLOCK_M
     BLOCK_N = tkl.sym.BLOCK_N
     BLOCK_K = tkl.sym.BLOCK_K
     # Address space (for GPU, shared(1) or global(0))
     ADDRESS_SPACE = tkl.sym.ADDRESS_SPACE
-    # Strides
-    A_STRIDE = tkl.sym.A_STRIDE
-    A_SCALE_STRIDE = tkl.sym.A_SCALE_STRIDE
-    B_STRIDE = tkl.sym.B_STRIDE
-    B_SCALE_STRIDE = tkl.sym.B_SCALE_STRIDE
 
     # Expose user-constraints
     constraints: list[tkw.Constraint] = [tkw.WorkgroupConstraint(M, BLOCK_M, 0)]
     constraints += [tkw.WorkgroupConstraint(N, BLOCK_N, 1)]
     constraints += [tkw.TilingConstraint(K, BLOCK_K)]
-    constraints += [tkw.WaveConstraint(M, BLOCK_M)]
-    constraints += [tkw.WaveConstraint(N, BLOCK_N)]
+    constraints += [tkw.WaveConstraint(M, BLOCK_M / 4)]
+    constraints += [tkw.WaveConstraint(N, BLOCK_N / 2)]
 
     constraints += [tkw.HardwareConstraint(threads_per_wave=64, mma_type=mfma_variant)]
-
-    SCALE_M = ceiling(M / 256) * 256
-    SCALE_N = ceiling(M / 256) * 256
-    SCALE_K = ceiling(ceiling(K / 32) / 8) * 8
-
-    SCALE_M = M
-    SCALE_N = N
-    SCALE_K = K / 32
 
     @tkw.wave(constraints)
     def gemm_afp4_wfp4_wave(
         a: tkl.Memory[M, K / 2, ADDRESS_SPACE, tkl.i8],
-        a_scale: tkl.Memory[SCALE_M, SCALE_K, ADDRESS_SPACE, tkl.i8],
+        a_scale: tkl.Memory[M, K / 32, ADDRESS_SPACE, tkl.i8],
         b: tkl.Memory[N, K / 2, ADDRESS_SPACE, tkl.i8],
-        b_scale: tkl.Memory[SCALE_N, SCALE_K, ADDRESS_SPACE, tkl.i8],
+        b_scale: tkl.Memory[N, K / 32, ADDRESS_SPACE, tkl.i8],
         c: tkl.Memory[M, N, GLOBAL_ADDRESS_SPACE, tkl.bf16],
     ):
         c_reg = tkl.Register[M, N, tkl.f32](0.0)
 
         @tkw.iterate(K, init_args=[c_reg])
         def repeat(acc: tkl.Register[M, N, tkl.f32]) -> tkl.Register[M, N, tkl.f32]:
-            a_reg = tkw.read(a)  # , stride=A_STRIDE)
+            a_reg = tkw.read(a)
             a_reg = tkw.bitcast(a_reg, tkl.f4e2m1fn)
-            a_scale_reg = tkw.read(a_scale)  # , stride=A_SCALE_STRIDE)
+            a_scale_reg = tkw.read(a_scale)
             a_scale_reg = tkw.bitcast(a_scale_reg, tkl.f8e8m0fnu)
-            b_reg = tkw.read(b)  # , stride=B_STRIDE)
+            b_reg = tkw.read(b)
             b_reg = tkw.bitcast(b_reg, tkl.f4e2m1fn)
-            b_scale_reg = tkw.read(b_scale)  # , stride=B_SCALE_STRIDE)
+            b_scale_reg = tkw.read(b_scale)
             b_scale_reg = tkw.bitcast(b_scale_reg, tkl.f8e8m0fnu)
             acc = tkw.scaled_mma(a_reg, a_scale_reg, b_reg, b_scale_reg, acc)
             return acc
@@ -104,13 +90,12 @@ def get_mxfp4_gemm(shape, c_dtype, use_async=False):
 
     hyperparams = {
         ADDRESS_SPACE: SHARED_ADDRESS_SPACE,
-        BLOCK_M: 16,
-        BLOCK_N: 16,
-        BLOCK_K: 128,
+        BLOCK_M: 256,
+        BLOCK_N: 256,
+        BLOCK_K: 256,
         M: shape[0],
         N: shape[1],
         K: shape[2],
-        K_SCALE: shape[2] // 32,
     }
     hyperparams.update(get_default_scheduling_params())
     schedule = SchedulingType.NONE
@@ -123,15 +108,13 @@ def get_mxfp4_gemm(shape, c_dtype, use_async=False):
         schedule=schedule,
         wave_runtime=True,
         dump_intermediates="./inter",
-        use_buffer_ops=False,
+        use_buffer_ops=True,
         waves_per_eu=1,
         use_global_to_shared=use_async,
         minimize_shared_allocs=False,
     )
     options = set_default_run_config(options)
     gemm = wave_compile(options, gemm_afp4_wfp4_wave)
-    with open("out.mlir", "w") as f:
-        f.write(gemm.asm)
     return gemm
 
 
@@ -231,11 +214,6 @@ def run_benchmark(args):
                 wave_shape = (M, N, K)
                 gemm = get_mxfp4_gemm(wave_shape, c_dtype)
                 wave_out = torch.empty(M, N, device=x.device, dtype=c_dtype)
-                # gemm(x, x_scale, w_t, w_scale, wave_out)
-                # triton_out = torch.empty(M, N, device="cuda", dtype=c_dtype)
-                # gemm_afp4wfp4(x, w.T, x_scale, w_scale, c_dtype, triton_out)
-                # torch.testing.assert_close(triton_out, wave_out)
-                # breakpoint()
 
                 x_scale = x_scale[:M, : K // SCALE_GROUP_SIZE]
                 w_scale = w_scale[:N, : K // SCALE_GROUP_SIZE]
@@ -244,6 +222,8 @@ def run_benchmark(args):
                     x, w, x_scale.view(torch.uint8), w_scale.view(torch.uint8), c_dtype
                 )
 
+                # NOTE: Smaller shapes fail since scale matrices are not contiguous.
+                # This is a temporary workaround while we implement dynamic strides in Wave.
                 x_scale = x_scale.contiguous()
                 w_scale = w_scale.contiguous()
 
@@ -259,6 +239,7 @@ def run_benchmark(args):
                     rep=100,
                 )
                 torch.testing.assert_close(torch_out, wave_out)
+
             elif args.backend == "wave_async":
                 wave_shape = (M, N, K)
                 gemm = get_mxfp4_gemm(wave_shape, c_dtype, use_async=True)

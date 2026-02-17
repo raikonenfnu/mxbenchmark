@@ -43,8 +43,9 @@ RUN git clone https://github.com/ROCm/aiter.git /workspace/aiter && \
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 ENV PATH="/root/.cargo/bin:$PATH"
 
-RUN git clone https://github.com/iree-org/wave.git /workspace/wave && \
+RUN https://github.com/suryajasper/wave.git /workspace/wave && \
     cd /workspace/wave && \
+    git checkout dynamic-strides && \
     pip install --no-cache-dir -r requirements-iree-pinned.txt --upgrade && \
     pip install -e .
 

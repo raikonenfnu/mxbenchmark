@@ -108,13 +108,16 @@ def get_mxfp4_gemm(shape, c_dtype, use_async=False):
         schedule=schedule,
         wave_runtime=True,
         dump_intermediates="./inter",
-        use_buffer_ops=True,
+        use_buffer_ops=False,
         waves_per_eu=1,
         use_global_to_shared=use_async,
         minimize_shared_allocs=False,
+        use_dynamic_strides=True,
     )
     options = set_default_run_config(options)
     gemm = wave_compile(options, gemm_afp4_wfp4_wave)
+    with open("out.mlir", "w") as f:
+        f.write(gemm.asm)
     return gemm
 
 
@@ -218,15 +221,6 @@ def run_benchmark(args):
                 x_scale = x_scale[:M, : K // SCALE_GROUP_SIZE]
                 w_scale = w_scale[:N, : K // SCALE_GROUP_SIZE]
 
-                torch_out = get_torch_reference(
-                    x, w, x_scale.view(torch.uint8), w_scale.view(torch.uint8), c_dtype
-                )
-
-                # NOTE: Smaller shapes fail since scale matrices are not contiguous.
-                # This is a temporary workaround while we implement dynamic strides in Wave.
-                x_scale = x_scale.contiguous()
-                w_scale = w_scale.contiguous()
-
                 ms = triton.testing.do_bench(
                     lambda: gemm(
                         x,
@@ -238,6 +232,11 @@ def run_benchmark(args):
                     warmup=25,
                     rep=100,
                 )
+
+                torch_out = get_torch_reference(
+                    x, w, x_scale.view(torch.uint8), w_scale.view(torch.uint8), c_dtype
+                )
+
                 torch.testing.assert_close(torch_out, wave_out)
 
             elif args.backend == "wave_async":
